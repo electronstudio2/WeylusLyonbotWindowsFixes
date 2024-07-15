@@ -15,6 +15,7 @@ let frame_count = 0;
 let last_fps_calc: number = performance.now();
 
 let check_video: HTMLInputElement;
+let webSocket: WebSocket;
 
 function run(access_code: string, websocket_port: number, level: string) {
     window.onload = () => {
@@ -93,12 +94,11 @@ function toggle_energysaving(energysaving: boolean) {
             settings.checks.get("enable_video").dispatchEvent(new Event("change"));
         } else
             settings.checks.get("enable_video").disabled = false;
-        new PointerHandler(settings.webSocket);
+        new PointerHandler();
     }
 }
 
 class Settings {
-    webSocket: WebSocket;
     checks: Map<string, HTMLInputElement>;
     capturable_select: HTMLSelectElement;
     frame_update_limit_input: HTMLInputElement;
@@ -111,8 +111,7 @@ class Settings {
     visible: boolean;
     settings: HTMLElement;
 
-    constructor(webSocket: WebSocket) {
-        this.webSocket = webSocket;
+    constructor() {
         this.checks = new Map<string, HTMLInputElement>();
         this.capturable_select = document.getElementById("window") as HTMLSelectElement;
         this.frame_update_limit_input = document.getElementById("frame_update_limit") as HTMLInputElement;
@@ -178,7 +177,7 @@ class Settings {
 
         let upd_pointer = () => {
             this.save_settings();
-            new PointerHandler(this.webSocket);
+            new PointerHandler();
         }
         this.checks.get("enable_mouse").onchange = upd_pointer;
         this.checks.get("enable_stylus").onchange = upd_pointer;
@@ -188,6 +187,13 @@ class Settings {
             this.save_settings();
             toggle_energysaving((e.target as HTMLInputElement).checked);
         };
+
+        this.checks.get("enable_virtual_keys").onchange = (e) => {
+            this.save_settings();
+            const vkContainer = document.getElementById("vk-container") as HTMLDivElement;
+            if ((e.target as HTMLInputElement).checked) vkContainer.classList.remove("hidden");
+            else vkContainer.classList.add("hidden");
+        }
 
         this.frame_update_limit_input.onchange = () => this.save_settings();
         this.range_min_pressure.onchange = () => this.save_settings();
@@ -199,7 +205,7 @@ class Settings {
         this.scale_video_input.onchange = upd_server_config;
         this.client_name_input.onchange = upd_server_config;
 
-        document.getElementById("refresh").onclick = () => this.webSocket.send('"GetCapturableList"');
+        document.getElementById("refresh").onclick = () => webSocket.send('"GetCapturableList"');
         this.capturable_select.onchange = () => this.send_server_config();
     }
 
@@ -215,7 +221,7 @@ class Settings {
         config["max_height"] = h;
         if (this.client_name_input.value)
             config["client_name"] = this.client_name_input.value;
-        this.webSocket.send(JSON.stringify({ "Config": config }));
+        webSocket.send(JSON.stringify({ "Config": config }));
     }
 
     save_settings() {
@@ -277,6 +283,10 @@ class Settings {
                 toggle_energysaving(true);
             }
 
+            if (!this.checks.get("enable_virtual_keys").checked) {
+                document.getElementById("vk-container").classList.add("hidden");
+            }
+
             let client_name = settings["client_name"];
             if (client_name)
                 this.client_name_input.value = client_name;
@@ -331,9 +341,210 @@ class Settings {
             // Can't find the window, so don't select anything
             this.capturable_select.value = "";
     }
+
+
 }
 
 let settings: Settings;
+
+interface VirtualKeyItem {
+    x: number; // percentage 0~100
+    y: number; // percentage 0~100
+    width: number; // in pixels
+    height: number; // in pixels
+
+    kEvent: KEvent | null; // ignoring its "event_type"
+}
+
+class VirtualKey {
+    container: HTMLDivElement;
+    editPanel: HTMLDivElement;
+
+    editing = false;
+    pointerEditing = false;
+
+    index = -1
+    items: ({ opt: VirtualKeyItem, el: HTMLElement })[] = [];
+
+    constructor() {
+        this.container = document.getElementById("vk-container") as HTMLDivElement;
+        this.editPanel = document.getElementById("vk-edit") as HTMLDivElement;
+
+        const enableEditing = document.getElementById("enable_edit_virtual_keys") as HTMLInputElement;
+        enableEditing.checked = false; // disable by default
+        enableEditing.onchange = e => {
+            this.editing = (e.target as HTMLInputElement).checked;
+            if (this.editing) {
+                document.addEventListener("keydown", globalKeydownHandler, true);
+                this.container.classList.add("isEditing");
+            } else {
+                document.removeEventListener("keydown", globalKeydownHandler, true);
+                this.container.classList.remove("isEditing");
+            }
+        }
+
+        const globalKeydownHandler = (e: KeyboardEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            this.applyOpt({
+                kEvent: new KEvent("down", e),
+            })
+            this.save();
+        }
+
+        document.getElementById("vk-add").onclick = (e) => {
+            e.preventDefault();
+            this.addKey({
+                x: 50,
+                y: 50,
+                width: 200,
+                height: 100,
+                kEvent: null,
+            })
+            this.save();
+        }
+        document.getElementById("vk-delete").onclick = (e) => {
+            e.preventDefault();
+            if (this.index < 0) return alert("No virtual key selected.");
+            this.deleteAndSave(this.index);
+        }
+
+        let storedSettings = localStorage.getItem("vk-settings");
+        if (storedSettings) {
+            let opts = JSON.parse(storedSettings) as VirtualKeyItem[];
+            for (let opt of opts) this.addKey(opt);
+        }
+    }
+
+    save() {
+        localStorage.setItem("vk-settings", JSON.stringify(this.items.map(it => it.opt)));
+    }
+
+    addKey(initialOpt: VirtualKeyItem) {
+        const el = document.createElement("div");
+        el.classList.add("vk-key");
+
+        const it = { opt: initialOpt, el };
+        this.items.push(it);
+        this.container.appendChild(el);
+        this.setIndex(this.items.length - 1);
+        this.applyOpt(initialOpt);
+
+        let killPressingStrikeTimer: () => void;
+        el.addEventListener("pointerdown", e => {
+            if (this.pointerEditing) return;
+
+            const pointerId = e.pointerId;
+            el.setPointerCapture(pointerId);
+            e.stopPropagation();
+            e.preventDefault();
+
+            this.setIndex(this.items.indexOf(it));
+            if (this.editing) {
+                this.pointerEditing = true;
+
+                const cx0 = e.clientX;
+                const cy0 = e.clientY;
+                const { x, y, width, height } = this.items[this.index].opt;
+
+                const onpointermove = (e: PointerEvent) => {
+                    if (e.pointerId !== pointerId) return
+                    const dx = e.clientX - cx0;
+                    const dy = e.clientY - cy0;
+
+                    this.applyOpt({
+                        x: x + dx / window.innerWidth * 100,
+                        y: y + dy / window.innerHeight * 100,
+                    })
+                }
+                const onpointerup = (e: PointerEvent) => {
+                    if (e.pointerId !== pointerId) return
+                    this.pointerEditing = false;
+                    window.removeEventListener("pointermove", onpointermove, true);
+                    window.removeEventListener("pointerup", onpointerup, true);
+                    window.removeEventListener("pointercancel", onpointerup, true);
+                    this.save();
+                }
+                window.addEventListener("pointermove", onpointermove, true);
+                window.addEventListener("pointerup", onpointerup, true);
+                window.addEventListener("pointercancel", onpointerup, true);
+
+                return
+            }
+
+            if (it.opt.kEvent) {
+                // regular send key 
+                const makePress = () => {
+                    el.classList.add("justPressed");
+                    webSocket.send(JSON.stringify({ "KeyboardEvent": it.opt.kEvent }));
+                    setTimeout(() => {
+                        el.classList.remove("justPressed");
+                        webSocket.send(JSON.stringify({ "KeyboardEvent": { ...it.opt.kEvent, event_type: "up" } }));
+                    }, 70);
+                }
+
+                makePress()
+                const timer = setTimeout(() => {
+                    el.classList.add("justPressed", "inCombo");
+                    const timer = setInterval(makePress, 120);
+                    killPressingStrikeTimer = () => {
+                        clearTimeout(timer)
+                        el.classList.remove("inCombo");
+                    };
+                }, 800); // if press for too long, start repeating the keypress
+                killPressingStrikeTimer = () => clearTimeout(timer);
+            }
+        })
+        el.addEventListener("pointerup", e => {
+            if (killPressingStrikeTimer) {
+                killPressingStrikeTimer();
+                killPressingStrikeTimer = null;
+            }
+        })
+    }
+
+    applyOpt(opt: Partial<VirtualKeyItem>) {
+        let e = this.items[this.index];
+        if (!e) return;
+
+        opt = e.opt = { ...e.opt, ...opt };
+
+        let text = '';
+
+        const kEvent = opt.kEvent;
+        if (kEvent) {
+            if (kEvent.alt) text += 'Alt+';
+            if (kEvent.ctrl) text += 'Ctrl+';
+            if (kEvent.shift) text += 'Shift+';
+            if (kEvent.meta) text += 'Meta+';
+            text += kEvent.code;
+        } else {
+            text = '<not set>';
+        }
+
+        e.el.style.cssText = `left: ${opt.x}%; top: ${opt.y}%; width: ${opt.width}px; height: ${opt.height}px;`;
+        e.el.textContent = text;
+    }
+
+    setIndex(index: number) {
+        this.items[this.index]?.el.classList.remove("isActive");
+        if (index < this.items.length) {
+            this.index = index;
+            this.items[this.index]?.el.classList.add("isActive");
+        } else {
+            this.index = -1
+        }
+    }
+
+    deleteAndSave(index: number) {
+        if (index === this.index) this.setIndex(-1);
+        if (index < this.index) this.index--;
+        const removed = this.items.splice(index, 1)[0];
+        removed?.el.remove()
+        this.save();
+    }
+}
 
 class PEvent {
     event_type: string;
@@ -596,15 +807,15 @@ class Painter {
 }
 
 class PointerHandler {
-    webSocket: WebSocket;
     pointerTypes: string[];
 
-    constructor(webSocket: WebSocket) {
+    constructor() {
         let video = document.getElementById("video");
         let canvas = document.getElementById("canvas");
-        this.webSocket = webSocket;
         this.pointerTypes = settings.pointer_types();
 
+        video.onpointerenter = (e) => this.onEvent(e, "pointerenter");
+        video.onpointerleave = (e) => this.onEvent(e, "pointerleave");
         video.onpointerdown = (e) => this.onEvent(e, "pointerdown");
         video.onpointerup = (e) => this.onEvent(e, "pointerup");
         video.onpointercancel = (e) => this.onEvent(e, "pointercancel");
@@ -615,11 +826,15 @@ class PointerHandler {
             painter = new Painter(canvas as HTMLCanvasElement);
 
         if (painter && painter.initialized) {
+            canvas.onpointerenter = (e) => this.onEvent(e, "pointerenter");
+            canvas.onpointerleave = (e) => this.onEvent(e, "pointerleave");
             canvas.onpointerdown = (e) => { this.onEvent(e, "pointerdown"); painter.onstart(e); };
             canvas.onpointerup = (e) => { this.onEvent(e, "pointerup"); painter.onstop(e); };
             canvas.onpointercancel = (e) => { this.onEvent(e, "pointercancel"); painter.onstop(e); };
             canvas.onpointermove = (e) => { this.onEvent(e, "pointermove"); painter.onmove(e); };
         } else {
+            canvas.onpointerenter = (e) => this.onEvent(e, "pointerenter");
+            canvas.onpointerleave = (e) => this.onEvent(e, "pointerleave");
             canvas.onpointerdown = (e) => this.onEvent(e, "pointerdown");
             canvas.onpointerup = (e) => this.onEvent(e, "pointerup");
             canvas.onpointercancel = (e) => this.onEvent(e, "pointercancel");
@@ -634,14 +849,14 @@ class PointerHandler {
 
         for (let elem of [video, canvas]) {
             elem.onwheel = (e) => {
-                this.webSocket.send(JSON.stringify({ "WheelEvent": new WEvent(e) }));
+                webSocket.send(JSON.stringify({ "WheelEvent": new WEvent(e) }));
             }
         }
     }
 
     onEvent(event: PointerEvent, event_type: string) {
         if (this.pointerTypes.includes(event.pointerType)) {
-            this.webSocket.send(
+            webSocket.send(
                 JSON.stringify(
                     {
                         "PointerEvent": new PEvent(
@@ -682,11 +897,7 @@ class KEvent {
 }
 
 class KeyboardHandler {
-    webSocket: WebSocket;
-
-    constructor(webSocket: WebSocket) {
-        this.webSocket = webSocket;
-
+    constructor() {
         let m = document.getElementById("main");
 
         m.onkeydown = (e) => {
@@ -703,14 +914,14 @@ class KeyboardHandler {
     }
 
     onEvent(event: KeyboardEvent, event_type: string) {
-        this.webSocket.send(JSON.stringify({ "KeyboardEvent": new KEvent(event_type, event) }));
+        webSocket.send(JSON.stringify({ "KeyboardEvent": new KEvent(event_type, event) }));
         event.preventDefault();
         event.stopPropagation();
         return false;
     }
 }
 
-function frame_timer(webSocket: WebSocket) {
+function frame_timer() {
     // Closing or closed, so no more frames
     if (webSocket.readyState > webSocket.OPEN)
         return;
@@ -724,13 +935,13 @@ function frame_timer(webSocket: WebSocket) {
     }
 
     if (document.hidden) {
-        requestAnimationFrame(() => frame_timer(webSocket));
+        requestAnimationFrame(() => frame_timer());
         return;
     }
 
     if (webSocket.readyState === webSocket.OPEN && check_video.checked)
         webSocket.send('"TryGetFrame"');
-    setTimeout(() => frame_timer(webSocket), settings.frame_update_limit());
+    setTimeout(() => frame_timer(), settings.frame_update_limit());
 }
 
 function handle_messages(
@@ -839,21 +1050,84 @@ function check_apis() {
 function init(access_code: string, websocket_port: number) {
     check_apis();
 
-    let authed = false;
-    let protocol = document.location.protocol == "https:" ? "wss://" : "ws://";
-    let webSocket = new WebSocket(protocol + window.location.hostname + ":" + websocket_port);
-    webSocket.binaryType = "arraybuffer";
+    const disconnectedNotice = document.getElementById("disconnected-notice") as HTMLDivElement;
+    const connectingNotice = document.getElementById("connecting-notice") as HTMLDivElement;
 
-    settings = new Settings(webSocket);
+    const video = document.getElementById("video") as HTMLVideoElement;
+    const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 
-    let video = document.getElementById("video") as HTMLVideoElement;
-    let canvas = document.getElementById("canvas") as HTMLCanvasElement;
+    let is_connected = false;
 
-    video.oncontextmenu = function(event) {
+    /** update global `webSocket` and start connecting */
+    const makeConnection = () => {
+        is_connected = false;
+        if (webSocket) webSocket.close();
+
+        connectingNotice.classList.remove("hidden");
+        disconnectedNotice.classList.add("hidden");
+
+        const protocol = document.location.protocol == "https:" ? "wss://" : "ws://";
+        const ws = webSocket = new WebSocket(protocol + window.location.hostname + ":" + websocket_port);
+
+        ws.binaryType = "arraybuffer";
+        ws.onopen = function () {
+            if (webSocket !== ws) return;
+            if (access_code) ws.send(access_code);
+            is_connected = true;
+
+            ws.send('"GetCapturableList"');
+            settings.send_server_config();
+
+            disconnectedNotice.classList.add("hidden");
+            connectingNotice.classList.add("hidden");
+        }
+
+        let disconnected = false;
+        let handle_disconnect = (msg: string) => {
+            if (webSocket !== ws) return;  // a outdated connection
+            if (disconnected) return;
+
+            is_connected = false;
+            disconnected = true;
+            disconnectedNotice.classList.remove("hidden");
+            connectingNotice.classList.add("hidden");
+            disconnectedNotice.querySelector("h2").textContent = msg;
+
+            function handleGlobalClick(e: MouseEvent) {
+                e.stopPropagation();
+                e.preventDefault();
+                document.body.removeEventListener("click", handleGlobalClick, true);
+                makeConnection()
+            }
+            document.body.addEventListener("click", handleGlobalClick, true);
+        }
+        ws.onerror = () => handle_disconnect("Lost connection.");
+        ws.onclose = () => handle_disconnect("Connection closed.");
+
+        let config_ok_received = false;
+        handle_messages(webSocket, video, () => {
+            if (!config_ok_received) {
+                new KeyboardHandler();
+                new PointerHandler();
+                frame_timer();
+                config_ok_received = true;
+            }
+        },
+            (err) => alert(err),
+            (window_names) => settings.onCapturableList(window_names)
+        );
+    }
+    makeConnection();
+
+    settings = new Settings();
+    new VirtualKey()
+
+
+    document.body.addEventListener("contextmenu", (event) => {
         event.preventDefault();
         event.stopPropagation();
         return false;
-    };
+    }, true);
 
     let toggle_fullscreen_btn = document.getElementById("fullscreen") as HTMLButtonElement;
 
@@ -871,46 +1145,17 @@ function init(access_code: string, websocket_port: number) {
         toggle_fullscreen_btn.parentElement.removeChild(toggle_fullscreen_btn);
     }
 
-    let handle_disconnect = (msg: string) => {
-        document.body.onclick = video.onclick = (e) => {
-            e.stopPropagation();
-            if (window.confirm(msg + " Reload page?"))
-                location.reload();
-        }
-    }
-    webSocket.onerror = () => handle_disconnect("Lost connection.");
-    webSocket.onclose = () => handle_disconnect("Connection closed.");
     window.onresize = () => {
         stretch_video();
         canvas.width = window.innerWidth * window.devicePixelRatio;
         canvas.height = window.innerHeight * window.devicePixelRatio;
         let [w, h] = calc_max_video_resolution(settings.scale_video_input.valueAsNumber);
         settings.scale_video_output.value = w + "x" + h;
-        if (authed)
+        if (is_connected)
             settings.send_server_config();
     }
     video.controls = false;
     video.onloadeddata = () => stretch_video();
-    let is_connected = false;
-    handle_messages(webSocket, video, () => {
-        if (!is_connected) {
-            new KeyboardHandler(webSocket);
-            new PointerHandler(webSocket);
-            frame_timer(webSocket);
-            is_connected = true;
-        }
-    },
-        (err) => alert(err),
-        (window_names) => settings.onCapturableList(window_names)
-    );
-    window.onunload = () => { webSocket.close(); }
-    webSocket.onopen = function(event) {
-        if (access_code)
-            webSocket.send(access_code);
-        authed = true;
-        webSocket.send('"GetCapturableList"');
-        settings.send_server_config();
-    }
 }
 
 // object-fit: fill; <-- this is unfortunately not supported on iOS, so we use the following
@@ -924,3 +1169,5 @@ function stretch_video() {
         video.style.transform = "scale(" + scale + ")";
     }
 }
+
+window.run = run;
